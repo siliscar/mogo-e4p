@@ -6,8 +6,10 @@
  * User revision: restore the solid track and circle buttons without liquid glass or cached control backdrops.
  */
 #include "ui_power_dialog.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "settings.h"
 #include "ui_kit.h"
 
 enum { HIT_NONE, HIT_SLIDER, HIT_RESTART, HIT_CANCEL };
@@ -178,6 +180,12 @@ void ui_power_final_draw(uint8_t *fb, bool restarting) {
     ui_clear_page(fb);
     const int cx = UI_LOCK_WIDTH / 2;
     ui_draw_icon(fb, cx, 486, 72, restarting ? UI_ICON_ROTATE_CW : UI_ICON_POWER, UI_GRAY_BLACK);
-    ui_text(fb, cx, 548, 48, restarting ? "正在重启" : "mogo 已关机", EPD_DRAW_ALIGN_CENTER, false);
+    // 关机文案跟随设置里保存的设备名称，不再写死品牌；整行按宽度适配，名字再长也不出屏。
+    // The shutdown line follows the device name saved in settings instead of a fixed brand,
+    // and the whole line fits the panel width however long the name is.
+    char line[96];
+    if (restarting) snprintf(line, sizeof(line), "%s", "正在重启");
+    else snprintf(line, sizeof(line), "%s 已关机", app_settings_device_name());
+    ui_text_box(fb, (EpdRect){36, 548, UI_LOCK_WIDTH - 72, 64}, 48, line, EPD_DRAW_ALIGN_CENTER, false);
     if (!restarting) ui_text(fb, cx, 624, 26, "长按电源键开机", EPD_DRAW_ALIGN_CENTER, false);
 }
