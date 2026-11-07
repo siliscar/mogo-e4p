@@ -30,6 +30,15 @@
 
 <br>
 
+> [!IMPORTANT]
+> **个人修改分支**：本仓库是 [chopper1026/mogo-e4p](https://github.com/chopper1026/mogo-e4p)（基于 [kiikoread](https://github.com/wegooo-cell/read-pico-reader) 开发）的**个人学习分支，非官方版本，与原作者无关联、未获背书**。许可沿用原仓库 [LICENSE](LICENSE) 与 `licenses/`，仅限个人非商业学习交流；商用需相应权利人事先书面授权。
+>
+> **相对上游 `1c4f1a1`（v1.0.6）的修改**见 [`mobi-jump-splash` 分支](./tree/mobi-jump-splash)（9 个文件，约 650 行）：
+> - **MOBI 格式补全**：`book_mobi.c` 新增 HUFF/CDIC 压缩记录解压（老式 Kindle MOBI）、NCX/INDX 目录解析（真实章节名与 filepos 锚点）、目录点击落点校验与回退
+> - **按比例跳转修复**：`app_book.c` / `book_toc.c` 滑块可连续拖动（局部刷新 + 节流）、松手提交跟踪值、页 ↔ 百分比严格互逆、0% 固定跳第 1 页
+> - **启动画面**：更换为「书页化鸟」灰阶徽标（AI 生成；默认锁屏与默认头像派生资源同步更换）
+> - **文档**：`docs/development/guides/MOBI.md` 同步更新
+
 ## 读书，也照顾阅读之外的小事
 
 mogo 是面向 **Metalio E-INK4 Plus（ESP32-S31）** 的独立阅读固件，基于 MindReset 阅读固件与 Metalio 板级实现适配，并非硬件厂商的官方固件。
