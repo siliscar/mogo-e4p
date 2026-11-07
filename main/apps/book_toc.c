@@ -93,9 +93,16 @@ int book_toc_hit(uint16_t x, uint16_t y, int page, size_t chapters) {
 }
 
 int book_toc_jump_hit(uint16_t x, uint16_t y) {
-    if (x >= 75 && x < 330 && y >= 850 && y < 907) return BOOK_TOC_JUMP_CANCEL;
-    if (x >= 354 && x < 609 && y >= 850 && y < 907) return BOOK_TOC_JUMP_CONFIRM;
-    if (x >= 75 && x < 609 && y >= 600 && y < 711) return BOOK_TOC_JUMP_TRACK;
+    // 命中区比按钮大一圈：绘制在 y 850–907，触摸实测会落在 907–909（差 1–3px），
+    // 贴边点会被整条丢弃。底部整带按左右两半判，中间缝隙也归右半的「跳转」。
+    // Hit areas run larger than the painted buttons: taps measured at y 907-909 sit 1-3 px below the
+    // drawn edge and were dropped. The whole bottom band splits by half, gap included in 跳转.
+    if (y >= 828 && y < 924) {
+        if (x >= 60 && x < 342) return BOOK_TOC_JUMP_CANCEL;
+        if (x >= 342 && x < 624) return BOOK_TOC_JUMP_CONFIRM;
+        return -1;
+    }
+    if (x >= 75 && x < 609 && y >= 592 && y < 719) return BOOK_TOC_JUMP_TRACK;
     return -1;
 }
 
@@ -105,11 +112,21 @@ int book_toc_jump_percent(uint16_t x) {
     return ((int)x - 92) * 100 / 500;
 }
 
+// 页 ↔ 百分比共用「每页等距、四舍五入」的映射：0% 必是首页、100% 必是末页，
+// 且两者严格互逆（否则跳完回显的百分比会把页码带偏一页）。
+// Pages and percents share one evenly spaced, round-to-nearest mapping: 0% is always the
+// first page and 100% the last, and the two directions are exact inverses of each other.
 int book_toc_page_from_percent(int percent, int pages) {
     if (pages <= 1 || percent <= 0) return 0;
     if (percent >= 100) return pages - 1;
-    int page = (percent * pages + 99) / 100 - 1;
+    int page = (percent * (pages - 1) + 50) / 100;
     return page < pages ? page : pages - 1;
+}
+
+int book_toc_percent_from_page(int page, int pages) {
+    if (pages <= 1 || page <= 0) return 0;
+    if (page >= pages - 1) return 100;
+    return (page * 100 + (pages - 1) / 2) / (pages - 1);
 }
 
 // 双像素深色轮廓让白色卡片在墨水屏上仍有清晰边界。/ Dark two-pixel outlines keep white cards legible on e-paper.
@@ -130,7 +147,7 @@ static void toc_pill(uint8_t *fb, EpdRect rect, const char *text, int px, bool s
 }
 
 void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
-                     size_t current, int page, const char *message) {
+                     size_t current, int page, const char *message, int jump_percent) {
     ui_clear_page(fb);
     ui_fill_rect_fast((EpdRect){0, 0, UI_LOCK_WIDTH, UI_LOCK_HEIGHT}, UI_GRAY_WHITE, fb);
     ui_nav_status(fb);
@@ -190,18 +207,24 @@ void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
     toc_border(fb, jump, 21, false);
     ui_text_box(fb,(EpdRect){58,1109,388,56},28,"按百分比跳转",EPD_DRAW_ALIGN_LEFT,false);
     char percent[24];
-    snprintf(percent, sizeof(percent), "%d%%  ›", (page + 1) * 100 / pages);
+    // 这里显示的是全书进度（与正文底部进度条同源），不是目录第几页。
+    // This shows whole-book progress from the same source as the reader footer bar, not the TOC page.
+    if (jump_percent < 0) jump_percent = 0;
+    if (jump_percent > 100) jump_percent = 100;
+    snprintf(percent, sizeof(percent), "%d%%  ›", jump_percent);
     ui_text_box(fb,(EpdRect){468,1109,158,56},28,percent,EPD_DRAW_ALIGN_RIGHT,false);
 }
 
-void book_toc_render_jump(uint8_t *fb, size_t chapters, int percent) {
+void book_toc_render_jump(uint8_t *fb, int percent, const char *target) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     EpdRect card = {44, 356, 596, 572};
     ui_fill_round_rect(fb, card, 30, UI_GRAY_WHITE);
     toc_border(fb, card, 30, true);
-    ui_text_box(fb,(EpdRect){(342)-250,393,500,44},32,"跳到目录位置",EPD_DRAW_ALIGN_CENTER,false);
-    ui_text_box(fb,(EpdRect){(342)-250,450,500,44},24,"选择百分比，先预览目标位置",
+    // 滑块定位的是全书进度，确认后直接跳到正文那一段，不再只翻目录页。
+    // The slider addresses whole-book progress: confirming moves the body there, not just the list.
+    ui_text_box(fb,(EpdRect){(342)-250,393,500,44},32,"跳到全书位置",EPD_DRAW_ALIGN_CENTER,false);
+    ui_text_box(fb,(EpdRect){(342)-250,450,500,44},24,"按全书进度定位，先预览目标章节",
                   EPD_DRAW_ALIGN_CENTER, false);
     char value[24]; snprintf(value, sizeof(value), "%d%%", percent);
     ui_text_fixed(fb, 342, 515, 55, value,EPD_DRAW_ALIGN_CENTER,false);
@@ -218,16 +241,8 @@ void book_toc_render_jump(uint8_t *fb, size_t chapters, int percent) {
     ui_fill_round_rect(fb, target_card, 19, 0xe8);
     toc_border(fb, target_card, 19, false);
     ui_text_box(fb,(EpdRect){99,747,486,30},23,"目标位置",EPD_DRAW_ALIGN_LEFT,false);
-    int pages = book_toc_pages(chapters);
-    int target = book_toc_page_from_percent(percent, pages);
-    size_t first = (size_t)target * BOOK_TOC_ROWS + 1;
-    size_t last = first + BOOK_TOC_ROWS - 1;
-    if (last > chapters) last = chapters;
     char summary[160];
-    if (chapters)
-        snprintf(summary, sizeof(summary), "约第 %d / %d 页 · 第 %u～%u 节",
-                 target + 1, pages, (unsigned)first, (unsigned)last);
-    else snprintf(summary, sizeof(summary), "这本书没有可用目录");
+    snprintf(summary, sizeof(summary), "%s", target && target[0] ? target : "这本书没有可用目录");
     fit_line(summary, 25, 486);
     ui_text_box(fb,(EpdRect){99,783,486,34},25,summary,EPD_DRAW_ALIGN_LEFT,false);
     toc_pill(fb, (EpdRect){75, 850, 255, 57}, "取消", 26, false);

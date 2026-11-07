@@ -469,6 +469,7 @@ static size_t s_text_len;
 static size_t s_selected_toc = SIZE_MAX;
 static bool s_toc_jump_open, s_toc_jump_drag;
 static int s_toc_jump_percent;
+static int64_t s_toc_jump_push_ms; ///< 上次推屏时刻，拖动节流 / Last push, throttles drag repaints
 static size_t s_jump_offset = SIZE_MAX, s_jump_page;
 static int s_px, s_margin[MARGIN_COUNT], s_line_spacing, s_turns, s_unsaved;
 static int64_t s_poll_ms, s_last_turn_ms;
@@ -1227,6 +1228,50 @@ static unsigned percent(size_t page) {
     uint32_t off = book_position_bytes(book_chapter_byte_offset(s_reader_session.position.chapter), chapter_end(),
                                        reader_page_offset(page), s_text_len);
     return (unsigned)((uint64_t)off * 100 / total);
+}
+// 全书百分比 → 章节 + 章内偏移；目录跳转与正文进度条共用这一份换算。
+// Whole-book percent to chapter and in-chapter offset; the TOC jump and the footer bar share it.
+static bool reader_percent_target(int at, size_t *chapter, size_t *offset) {
+    uint32_t total = book_total_bytes();
+    size_t count = book_chapter_count();
+    if (!total || !count) return false;
+    if (at < 0) at = 0;
+    if (at > 100) at = 100;
+    uint32_t want = (uint32_t)((uint64_t)total * (unsigned)at / 100);
+    size_t index = 0;
+    for (size_t i = 1; i < count && book_chapter_byte_offset(i) <= want; ++i) index = i;
+    uint32_t base = book_chapter_byte_offset(index);
+    if (chapter) *chapter = index;
+    if (offset) *offset = want > base ? (size_t)(want - base) : 0;
+    return true;
+}
+// 目录底部与正文进度条必须是同一个数，否则同一位置会出现两个百分比。
+// The TOC footer and the reader's progress bar must be one number, or one position shows two percents.
+static int reader_book_percent(void) { return (int)percent(s_reader_session.position.page); }
+// 目标位置的预览文案：优先按目录条目编号（与目录页的“N 节”一致），没有条目才退回章节序号。
+// Preview label for a target position: prefer the authored TOC ordinal so it matches the list,
+// falling back to the chapter ordinal when there is no navigation.
+static void reader_percent_label(int at, char *out, size_t cap) {
+    out[0] = 0;
+    if (at < 0) at = 0;
+    if (at > 100) at = 100;
+    size_t chapter = 0, source = 0;
+    if (!reader_percent_target(at, &chapter, &source)) return;
+    const size_t nav_count = book_navigation_count();
+    const uint32_t want = (uint32_t)((uint64_t)book_total_bytes() * (unsigned)at / 100);
+    size_t pick = SIZE_MAX;
+    for (size_t i = 0; i < nav_count; ++i) {
+        size_t off = book_navigation_source_offset(i);
+        if (off == SIZE_MAX || off > want || book_navigation_chapter(i) > chapter) break;
+        pick = i;
+    }
+    char title[96] = {0};
+    if (pick != SIZE_MAX && book_navigation_title(pick, title, sizeof(title)) == ESP_OK && title[0])
+        snprintf(out, cap, "第 %u / %u 节 · %s", (unsigned)pick + 1, (unsigned)nav_count, title);
+    else if (book_chapter_title(chapter, title, sizeof(title)) == ESP_OK && title[0])
+        snprintf(out, cap, "第 %u / %u 节 · %s", (unsigned)chapter + 1,
+                 (unsigned)book_chapter_count(), title);
+    else snprintf(out, cap, "第 %u / %u 节", (unsigned)chapter + 1, (unsigned)book_chapter_count());
 }
 static pending_progress_t* pending_find(const char* path) {
     for (pending_progress_t* p = s_pending; p; p = p->next) if (!strcmp(p->path, path)) return p;
@@ -3538,9 +3583,13 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
     }
     if (s_view == TOC) {
         book_toc_render(fb, s_reader_session.book.title[0] ? s_reader_session.book.title : s_reader_session.book.chapter_title,
-                        book_navigation_count(), current_toc_position(), ctx->leaf, s_message);
-        if (s_toc_jump_open)
-            book_toc_render_jump(fb, book_navigation_count(), s_toc_jump_percent);
+                        book_navigation_count(), current_toc_position(), ctx->leaf, s_message,
+                        reader_book_percent());
+        if (s_toc_jump_open) {
+            char target[160];
+            reader_percent_label(s_toc_jump_percent, target, sizeof(target));
+            book_toc_render_jump(fb, s_toc_jump_percent, target);
+        }
         unlock_draw();
         return;
     }
@@ -4195,6 +4244,11 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
              book_layout_page_for_offset(anchor || source_offset != SIZE_MAX ? candidate.anchor_offset : offset);
     s_jump_offset = anchor || source_offset != SIZE_MAX ? candidate.anchor_offset : SIZE_MAX;
     s_jump_page = s_reader_session.position.page;
+    if (anchor || source_offset != SIZE_MAX)
+        ESP_LOGI(TAG, "toc target anchor=%d source=%zu mapped=%zu page=%u/%u",
+                 anchor != NULL, source_offset, candidate.anchor_offset,
+                 (unsigned)s_reader_session.position.page + 1,
+                 (unsigned)book_layout_page_count());
     if (book_chapter_title(chapter, s_reader_session.book.chapter_title, sizeof(s_reader_session.book.chapter_title)) != ESP_OK)
         snprintf(s_reader_session.book.chapter_title, sizeof(s_reader_session.book.chapter_title), "第 %u 节", (unsigned)chapter + 1);
     copy_text(s_font_path, sizeof(s_font_path), ttf_font_path());
@@ -6137,9 +6191,44 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
                 s_toc_jump_percent = book_toc_jump_percent(x);
                 return APP_REDRAW_PAGE;
             }
-            if (choice == BOOK_TOC_JUMP_CONFIRM)
-                ctx->leaf = book_toc_page_from_percent(s_toc_jump_percent, leaves());
+            bool confirmed = choice == BOOK_TOC_JUMP_CONFIRM;
             s_toc_jump_open = s_toc_jump_drag = false;
+            if (confirmed) {
+                // 百分比是全书进度：确认后把正文移到该位置并回到阅读页，而不是只翻目录页。
+                // The percentage is whole-book progress: confirming moves the body there and returns to
+                // the reader, instead of only turning TOC pages.
+                size_t chapter = 0, source = 0;
+                if (reader_percent_target(s_toc_jump_percent, &chapter, &source)) {
+                    ESP_LOGI(TAG, "jump target pct=%d chapter=%u source=%zu",
+                             s_toc_jump_percent, (unsigned)chapter, source);
+                    save_progress();
+                    set_reader_view(READING);
+                    s_reader_panel = READER_PANEL_NONE;
+                    if (load_chapter_at(ctx, chapter, 0, false, NULL, SIZE_MAX)) {
+                        // 章内按页扫描：percent() 随页单调递增，取不超过目标的最后一页。
+                        // 这样不依赖各格式的 anchor/source 偏移映射，TXT 与非 MOBI 也走同一条路。
+                        // Scan pages: percent() rises with the page, so the last page at or below the
+                        // target is the landing spot. No per-format anchor mapping is involved, which
+                        // keeps TXT and other backends on the same path.
+                        size_t pages = book_layout_page_count(), best = 0;
+                        // 0% 单独钉在第 1 页：全书前 1% 的字节可能铺满好几页，它们的 percent
+                        // 都是 0，按"最后一个 ≤ 目标"会把 0% 落到前言中部而不是封面。
+                        // Pin 0% to the first page: the first 1% of the book can span several
+                        // pages that all read percent 0, and "last page at or below" would drop
+                        // the jump mid-front-matter instead of on the cover.
+                        if (s_toc_jump_percent > 0)
+                            for (size_t p = 0; p < pages; ++p) {
+                                if ((int)percent(p) > s_toc_jump_percent) break;
+                                best = p;
+                            }
+                        s_reader_session.position.page = best;
+                        s_selected_toc = SIZE_MAX;
+                        ESP_LOGI(TAG, "jump landed page=%u/%u pct=%u",
+                                 (unsigned)best + 1, (unsigned)pages, percent(best));
+                        save_progress();
+                    }
+                }
+            }
             return APP_REDRAW_PAGE;
         }
         int target = book_toc_hit(x, y, ctx->leaf, book_navigation_count());
@@ -6160,12 +6249,21 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
         }
         if (target == BOOK_TOC_JUMP && book_navigation_count()) {
             s_toc_jump_open = true;
-            s_toc_jump_percent = (ctx->leaf + 1) * 100 / leaves();
+            // 打开时对齐当前阅读位置，和正文底部进度条显示同一个数。
+            // Seed from the current reading position so it matches the reader's footer bar exactly.
+            s_toc_jump_percent = reader_book_percent();
             return APP_REDRAW_PAGE;
         }
         if (target >= 0 && !s_message[0]) {
             size_t chapter = book_navigation_chapter((size_t)target);
             if (chapter >= book_chapter_count()) return APP_REDRAW_NONE;
+            // 目录条目落点链路单独留痕：章、章内偏移与标题一次点按即可核对。
+            // One log per entry tap pins the landing chain: chapter, in-segment offset and title.
+            char nav_title[128] = {0};
+            (void)book_navigation_title((size_t)target, nav_title, sizeof(nav_title));
+            ESP_LOGI(TAG, "toc entry=%u chapter=%u source=%zu title=%s", (unsigned)target,
+                     (unsigned)chapter, book_navigation_source_offset((size_t)target),
+                     nav_title[0] ? nav_title : "-");
             save_progress();
             set_reader_view(READING);
             if (load_chapter_at(ctx, chapter, 0, false, book_navigation_anchor((size_t)target),
@@ -6771,26 +6869,50 @@ static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) 
         if (s_toc_jump_open) {
             if (ev->type == UI_GESTURE_PRESS &&
                 book_toc_jump_hit(ev->x0, ev->y0) == BOOK_TOC_JUMP_TRACK) {
+                // 按下必须只推局部：PAGE 会让 present_page 立刻取消手势，之后再也收不到 MOVE。
+                // A press must push a partial area: PAGE makes present_page cancel the gesture, so no
+                // MOVE ever arrives and the slider can only be flicked, never dragged.
                 s_toc_jump_drag = true;
                 s_toc_jump_percent = book_toc_jump_percent(ev->x0);
-                return APP_REDRAW_PAGE;
+                s_toc_jump_push_ms = ctx->now_ms;
+                ESP_LOGI(TAG, "jump press x0=%u y0=%u pct=%d", ev->x0, ev->y0, s_toc_jump_percent);
+                render(ctx, ctx->fb);
+                s_area = (EpdRect){44, 480, 596, 250};
+                s_mode = MODE_GL16;
+                return APP_REDRAW_AREA;
             }
             if (s_toc_jump_drag && ev->type == UI_GESTURE_MOVE) {
                 int next = book_toc_jump_percent(ev->x);
                 if (next == s_toc_jump_percent) return APP_REDRAW_NONE;
                 s_toc_jump_percent = next;
+                // 触摸帧 5ms 一帧、一次刷新上百毫秒：节流到 120ms，松手时再补一次终值。
+                // Touch frames arrive every 5ms while a refresh costs hundreds; throttle to 120ms and
+                // commit the final value on release.
+                if (ctx->now_ms - s_toc_jump_push_ms < 120) return APP_REDRAW_NONE;
+                s_toc_jump_push_ms = ctx->now_ms;
+                ESP_LOGI(TAG, "jump move x=%u pct=%d", ev->x, next);
                 render(ctx, ctx->fb);
-                s_area = (EpdRect){44, 356, 596, 572};
+                s_area = (EpdRect){44, 480, 596, 250};
                 s_mode = MODE_GL16;
                 return APP_REDRAW_AREA;
             }
             if (s_toc_jump_drag && ev->type != UI_GESTURE_PRESS) {
                 s_toc_jump_drag = false;
                 if (ev->type == UI_GESTURE_CANCEL) return APP_REDRAW_NONE;
-                s_toc_jump_percent = book_toc_jump_percent(ev->x);
+                // 松手不再按释放点重算：释放坐标与最后一条 MOVE 相差数个百分点，会让屏幕上
+                // 看到的数字和实际跳转值分家。这里整页重绘一次，把已跟踪的终值和目标位置预览
+                // 一起定下来，用户点「跳转」时用的就是看到的那个数。
+                // Do not recompute from the release point: it drifts several percent from the last
+                // MOVE, which desynchronised the label from the value actually used. One full redraw
+                // commits the tracked value together with the target preview.
+                ESP_LOGI(TAG, "jump release pct=%d", s_toc_jump_percent);
                 return APP_REDRAW_PAGE;
             }
-            if (ev->type == UI_GESTURE_TAP) return action_at(ctx, ev->x0, ev->y0);
+            if (ev->type == UI_GESTURE_TAP) {
+                ESP_LOGI(TAG, "jump tap x0=%u y0=%u hit=%d", ev->x0, ev->y0,
+                         book_toc_jump_hit(ev->x0, ev->y0));
+                return action_at(ctx, ev->x0, ev->y0);
+            }
             return APP_REDRAW_NONE;
         }
         if (ev->type == UI_GESTURE_TAP) {

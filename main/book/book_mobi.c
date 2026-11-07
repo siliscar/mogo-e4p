@@ -25,10 +25,13 @@
 #define TEXT_MAX (64u * 1024u * 1024u)
 #define META_MAX (1024u * 1024u)
 #define SEGMENT_TARGET (96u * 1024u)
-#define CACHE_VERSION 1u
+// 2：目录改为优先 NCX，旧缓存需重建。/ 2: NCX-first navigation invalidates older caches.
+#define CACHE_VERSION 2u
 #define PATH_CAP 512u
 
 typedef struct { uint32_t offset, raw, len; } record_t;
+typedef struct { const uint8_t *data; uint32_t len; bool shared, busy; } cdic_t;
+typedef struct { uint8_t *data; size_t len, cap; bool failed; } huff_buf_t;
 typedef struct { uint32_t offset; char title[MOBI_TITLE_CAP]; } navigation_t;
 typedef struct { char title[256], author[160]; } metadata_t;
 struct book_mobi {
@@ -41,6 +44,14 @@ struct book_mobi {
     size_t count, segment_cap;
     navigation_t *navigation;
     size_t nav_count, nav_cap;
+    uint32_t huff_offset, huff_count; ///< HUFF/CDIC 表位置 / HUFF-CDIC tables
+    uint32_t ncx_index;               ///< INDX/NCX 主记录 / Main INDX record
+    struct { uint8_t codelen; bool term; uint64_t maxcode; } dict1[256];
+    uint64_t mincode[33], maxcode[33];
+    cdic_t *dict;
+    size_t dict_count, dict_cap;
+    uint8_t **pool;
+    size_t pool_count, pool_cap;
     metadata_t metadata;
     char path[PATH_CAP];
 };
@@ -127,12 +138,24 @@ static esp_err_t headers(const char *path, book_mobi_t **out) {
     if (mobi_len < 116 || mobi_len > head_len - 16) { err = ESP_ERR_INVALID_SIZE; goto fail; }
     if (be32(head + 24) != 2 || be32(head + 36) != 6) goto fail;
     b->compression = be16(head);
-    if (b->compression != 1 && b->compression != 2) goto fail;
+    if (b->compression != 1 && b->compression != 2 && b->compression != 17480) goto fail;
     b->encoding = be32(head + 28);
     if (b->encoding != 65001 && b->encoding != 1252) goto fail;
     b->total = be32(head + 4); b->text_records = be16(head + 8);
     b->first_image = be32(head + 108);
     if (mobi_len >= 228) b->extra = be16(head + 242);
+    // 这三个字段在记录 0 里按 PalmDOC 头之后的绝对偏移给出。
+    // These three live at absolute offsets in record 0, after the PalmDOC header.
+    if (head_len >= 0x78) {
+        uint32_t huff = be32(head + 0x70), count = be32(head + 0x74);
+        if (huff && huff < b->records && count && count < 64) { b->huff_offset = huff; b->huff_count = count; }
+    }
+    // 目录索引字段在 0xF4，落在声明的头长（常见 0xE8）之外，只能按记录长度判断。
+    // The NCX field sits at 0xF4, past the declared header length (often 0xE8); bound it by the record.
+    if (head_len >= 0xf8) {
+        uint32_t ncx = be32(head + 0xf4);
+        if (ncx != UINT32_MAX && ncx < b->records) b->ncx_index = ncx;
+    }
     err = ESP_ERR_INVALID_SIZE;
     if (!b->total || b->total > TEXT_MAX || !b->text_records || b->text_records >= b->records ||
         !be16(head + 10)) goto fail;
@@ -176,6 +199,9 @@ fail:
     return err;
 }
 
+static bool huff_ready(book_mobi_t *b);
+static bool huff_inflate(book_mobi_t *b, const uint8_t *data, size_t len, huff_buf_t *out, int depth);
+
 static esp_err_t decode_record(book_mobi_t *b, size_t record, uint8_t *compressed, uint8_t *raw, size_t *len) {
     size_t n = b->record[record + 1].offset - b->record[record].offset;
     esp_err_t err = read_at(b, b->record[record].offset, compressed, n);
@@ -201,6 +227,13 @@ static esp_err_t decode_record(book_mobi_t *b, size_t record, uint8_t *compresse
     *len = RECORD_BYTES;
     if (b->compression == 2) {
         if (!mobi_codec_palmdoc(raw, len, compressed, n)) return ESP_ERR_INVALID_RESPONSE;
+    } else if (b->compression == 17480) {
+        // HUFF/CDIC：码表与词典在首次解压时装载，之后只查表。
+        // HUFF-CDIC: the code table and dictionary load on first decode, then lookups only.
+        if (!huff_ready(b)) return ESP_ERR_NOT_SUPPORTED;
+        huff_buf_t sink = {raw, 0, RECORD_BYTES, false};
+        if (!huff_inflate(b, compressed, n, &sink, 0) || !sink.len) return ESP_ERR_INVALID_RESPONSE;
+        *len = sink.len;
     } else { memcpy(raw, compressed, n); *len = n; }
     return ESP_OK;
 }
@@ -215,6 +248,376 @@ static bool grow(void **array, size_t *capacity, size_t count, size_t item_size,
     *array = p; *capacity = cap;
     return true;
 }
+/* ---- HUFF/CDIC 解码 / HUFF-CDIC decoding ---- */
+
+
+static bool hbuf_add(huff_buf_t *b, const uint8_t *src, size_t n) {
+    if (b->failed) return false;
+    if (n > b->cap - b->len) { b->failed = true; return false; }
+    memcpy(b->data + b->len, src, n);
+    b->len += n;
+    return true;
+}
+
+static uint8_t *record_read(book_mobi_t *b, size_t index, size_t *len, size_t cap) {
+    if (!b || index >= b->records) return NULL;
+    size_t n = b->record[index + 1].offset - b->record[index].offset;
+    if (!n || n > cap) return NULL;
+    uint8_t *data = allocate(n);
+    if (!data) return NULL;
+    if (read_at(b, b->record[index].offset, data, n) != ESP_OK) { free(data); return NULL; }
+    *len = n;
+    return data;
+}
+
+static bool pool_keep(book_mobi_t *b, uint8_t *data) {
+    if (b->pool_count == b->pool_cap) {
+        size_t cap = b->pool_cap ? b->pool_cap * 2 : 4;
+        uint8_t **grown = heap_caps_realloc(b->pool, cap * sizeof(*grown), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!grown) return false;
+        b->pool = grown;
+        b->pool_cap = cap;
+    }
+    b->pool[b->pool_count++] = data;
+    return true;
+}
+
+static bool dict_append(book_mobi_t *b, const cdic_t *entry) {
+    if (b->dict_count == b->dict_cap) {
+        size_t cap = b->dict_cap ? b->dict_cap * 2 : 512;
+        cdic_t *grown = heap_caps_realloc(b->dict, cap * sizeof(*grown), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!grown) return false;
+        b->dict = grown;
+        b->dict_cap = cap;
+    }
+    b->dict[b->dict_count++] = *entry;
+    return true;
+}
+
+static bool huff_inflate(book_mobi_t *b, const uint8_t *data, size_t len, huff_buf_t *out, int depth);
+
+// 展开一条词典短语；嵌套条目递归解码后再当作普通字节。
+// Expand one dictionary phrase; a nested entry is decoded recursively and then treated as bytes.
+static bool huff_phrase(book_mobi_t *b, cdic_t *entry, huff_buf_t *out, int depth) {
+    if (entry->shared) return hbuf_add(out, entry->data, entry->len);
+    if (entry->busy || depth > 6) return false;
+    entry->busy = true;
+    bool ok = huff_inflate(b, entry->data, entry->len, out, depth);
+    entry->busy = false;
+    return ok;
+}
+
+static bool huff_inflate(book_mobi_t *b, const uint8_t *data, size_t len, huff_buf_t *out, int depth) {
+    if (!len) return false;
+    uint8_t *window = heap_caps_calloc(1, len + 16, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!window) return false;
+    memcpy(window, data, len);
+    long bits_left = (long)len * 8;
+    size_t pos = 0;
+    uint64_t x = ((uint64_t)be32(window) << 32) | be32(window + 4);
+    long n = 32;
+    bool ok = true;
+    for (;;) {
+        if (n <= 0) {
+            pos += 4;
+            if (pos + 8 > len + 16) break;
+            x = ((uint64_t)be32(window + pos) << 32) | be32(window + pos + 4);
+            n += 32;
+        }
+        uint32_t code = (uint32_t)((x >> (unsigned)n) & 0xffffffffull);
+        unsigned codelen = b->dict1[code >> 24].codelen;
+        uint64_t maxcode = b->dict1[code >> 24].maxcode;
+        bool term = b->dict1[code >> 24].term;
+        if (!term) {
+            while (codelen <= 32 && (uint64_t)code < b->mincode[codelen]) ++codelen;
+            if (codelen > 32) { ok = false; break; }
+            maxcode = b->maxcode[codelen];
+        }
+        n -= (long)codelen;
+        bits_left -= (long)codelen;
+        if (bits_left < 0) break;
+        uint64_t index = (maxcode - code) >> (32 - codelen);
+        if (index >= b->dict_count) { ok = false; break; }
+        if (!huff_phrase(b, &b->dict[index], out, depth + 1)) { ok = false; break; }
+        if (out->failed) { ok = false; break; }
+    }
+    free(window);
+    return ok;
+}
+
+static bool huff_load_table(book_mobi_t *b, size_t index) {
+    size_t n = 0;
+    uint8_t *huff = record_read(b, index, &n, 65536u);
+    if (!huff) return false;
+    bool ok = false;
+    do {
+        if (n < 24 || memcmp(huff, "HUFF", 4) != 0) break;
+        uint32_t off1 = be32(huff + 8), off2 = be32(huff + 12);
+        if ((uint64_t)off1 + 1024 > n || (uint64_t)off2 + 256 > n) break;
+        bool bad = false;
+        for (unsigned i = 0; i < 256; ++i) {
+            uint32_t v = be32(huff + off1 + i * 4);
+            unsigned codelen = v & 0x1f;
+            if (!codelen) { bad = true; break; }
+            uint32_t maxcode = v >> 8;
+            b->dict1[i].codelen = (uint8_t)codelen;
+            b->dict1[i].term = (v & 0x80) != 0;
+            // 参考实现用任意精度整数；64 位足以保住 33 位 maxcode。
+            // The reference uses arbitrary precision; 64 bits keep a 33-bit maxcode intact.
+            b->dict1[i].maxcode = (((uint64_t)maxcode + 1u) << (32 - codelen)) - 1;
+        }
+        if (bad) break;
+        for (unsigned i = 1; i <= 32; ++i) {
+            uint32_t low = be32(huff + off2 + (i - 1) * 8);
+            uint32_t high = be32(huff + off2 + (i - 1) * 8 + 4);
+            b->mincode[i] = (uint64_t)low << (32 - i);
+            b->maxcode[i] = (((uint64_t)high + 1u) << (32 - i)) - 1;
+        }
+        ok = true;
+    } while (0);
+    free(huff);
+    return ok;
+}
+
+static bool huff_load_cdic(book_mobi_t *b, size_t index) {
+    size_t n = 0;
+    uint8_t *cdic = record_read(b, index, &n, 1048576u);
+    if (!cdic) return false;
+    if (n < 16 || memcmp(cdic, "CDIC", 4) != 0 || be32(cdic + 4) != 0x10) { free(cdic); return false; }
+    uint32_t phrases = be32(cdic + 8), bits = be32(cdic + 12);
+    if (bits > 24) { free(cdic); return false; }
+    uint64_t room = phrases > b->dict_count ? phrases - b->dict_count : 0;
+    uint64_t count = 1ull << bits;
+    if (room < count) count = room;
+    if (16 + count * 2 > n) { free(cdic); return false; }
+    if (!pool_keep(b, cdic)) { free(cdic); return false; }
+    for (uint64_t i = 0; i < count; ++i) {
+        uint32_t at = 16u + be16(cdic + 16 + (size_t)i * 2);
+        if ((uint64_t)at + 2 > n) return false;
+        uint16_t head = be16(cdic + at);
+        uint32_t bytes = head & 0x7fff;
+        if ((uint64_t)at + 2 + bytes > n) return false;
+        cdic_t entry = {cdic + at + 2, bytes, (head & 0x8000) != 0, false};
+        if (!dict_append(b, &entry)) return false;
+    }
+    return true;
+}
+
+static bool huff_ready(book_mobi_t *b) {
+    if (b->dict_count) return true;
+    if (!b->huff_offset || !b->huff_count || b->huff_offset >= b->records) return false;
+    if (!huff_load_table(b, b->huff_offset)) return false;
+    for (uint32_t i = 1; i < b->huff_count; ++i) {
+        if (b->huff_offset + i >= b->records) return false;
+        if (!huff_load_cdic(b, b->huff_offset + i)) return false;
+    }
+    return b->dict_count != 0;
+}
+
+/* ---- INDX/NCX 目录 / INDX-NCX navigation ---- */
+
+typedef struct { uint8_t tag, values, mask, end; } tagx_t;
+typedef struct { uint32_t key, len; const char *text; } ctoc_t;
+typedef struct { bool ok; uint32_t len, start, count, nctoc; } indx_head_t;
+
+static bool vwi_read(const uint8_t *data, size_t len, size_t *at, uint32_t *out) {
+    uint32_t value = 0;
+    size_t i = *at;
+    for (unsigned n = 0; n < 5 && i < len; ++n) {
+        uint8_t byte = data[i++];
+        value = (value << 7) | (byte & 0x7f);
+        if (byte & 0x80) { *at = i; *out = value; return true; }
+    }
+    return false;
+}
+
+static unsigned bit_count(uint8_t value) {
+    unsigned count = 0;
+    while (value) { count += value & 1u; value >>= 1; }
+    return count;
+}
+
+static indx_head_t indx_head(const uint8_t *data, size_t len) {
+    indx_head_t head = {0};
+    if (len < 0x38 || memcmp(data, "INDX", 4) != 0) return head;
+    head.len = be32(data + 4);
+    head.start = be32(data + 20);
+    head.count = be32(data + 24);
+    head.nctoc = be32(data + 52);
+    head.ok = head.len < len;
+    return head;
+}
+
+// 按 TAGX 走完一条目录项，取回 pos / noffs。
+// Walk one index entry through the TAGX control bytes and keep pos/noffs.
+static bool index_entry(const uint8_t *data, size_t len, size_t begin, size_t end,
+                        const tagx_t *tags, size_t ntags, size_t control_bytes,
+                        uint32_t *pos, uint32_t *noffs) {
+    if (begin >= len || end > len || begin >= end) return false;
+    size_t text_len = data[begin];
+    size_t control = begin + 1 + text_len;
+    if (control > end) return false;
+    size_t data_at = control + control_bytes;
+    size_t ctrl_index = 0;
+    for (size_t i = 0; i < ntags; ++i) {
+        if (tags[i].end) { ++ctrl_index; continue; }
+        if (control + ctrl_index >= end) return false;
+        uint8_t raw = data[control + ctrl_index];
+        uint8_t value = raw & tags[i].mask;
+        if (!value) continue;
+        size_t values = 0;
+        if (value == tags[i].mask && bit_count(tags[i].mask) > 1) {
+            uint32_t bytes = 0;
+            if (!vwi_read(data, len, &data_at, &bytes)) return false;
+            size_t consumed = 0;
+            while (consumed < bytes) {
+                size_t before = data_at;
+                uint32_t ignored = 0;
+                if (!vwi_read(data, len, &data_at, &ignored)) return false;
+                consumed += data_at - before;
+                ++values;
+            }
+        } else if (value == tags[i].mask) {
+            values = 1;
+        } else {
+            uint8_t mask = tags[i].mask, shifted = value;
+            while (!(mask & 1u)) { mask >>= 1; shifted >>= 1; }
+            values = (size_t)shifted * (tags[i].values ? tags[i].values : 1);
+        }
+        for (size_t v = 0; v < values; ++v) {
+            for (unsigned repeat = 0; repeat < (tags[i].values ? tags[i].values : 1); ++repeat) {
+                uint32_t number = 0;
+                if (!vwi_read(data, len, &data_at, &number)) return false;
+                if (!v && !repeat) {
+                    if (tags[i].tag == 1) *pos = number;
+                    else if (tags[i].tag == 3) *noffs = number;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static int ctoc_cmp(const void *a, const void *b) {
+    const ctoc_t *left = a, *right = b;
+    if (left->key == right->key) return 0;
+    return left->key < right->key ? -1 : 1;
+}
+
+// 读 ncx 编译出的 INDX：主记录带 TAGX，随后是子记录与 CTOC 字符串块。
+// Read the INDX built from the ncx: a TAGX main record, sub-records and CTOC blocks.
+static esp_err_t ncx_navigation(book_mobi_t *b) {
+    if (!b->ncx_index || b->ncx_index >= b->records) return ESP_OK;
+    size_t idx_len = 0;
+    uint8_t *main = record_read(b, b->ncx_index, &idx_len, 1048576u);
+    if (!main) return ESP_ERR_NOT_FOUND;
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    indx_head_t head = indx_head(main, idx_len);
+    uint8_t *sources[8] = {0};
+    size_t source_len[8] = {0};
+    ctoc_t *map = NULL;
+    size_t map_count = 0, map_cap = 0;
+    navigation_t *built = NULL;
+    size_t built_count = 0, built_cap = 0;
+    if (!head.ok || head.count > 64 || head.nctoc > 8) goto done;
+    if ((uint64_t)head.len + 12 > idx_len || memcmp(main + head.len, "TAGX", 4) != 0) goto done;
+    uint32_t tagx_end = be32(main + head.len + 4);
+    uint32_t control_bytes = be32(main + head.len + 8);
+    if (tagx_end < 12 || (uint64_t)head.len + tagx_end > idx_len || !control_bytes || control_bytes > 4) goto done;
+    size_t tag_count = (tagx_end - 12) / 4;
+    tagx_t tags[16];
+    if (tag_count > sizeof(tags) / sizeof(tags[0])) tag_count = sizeof(tags) / sizeof(tags[0]);
+    for (size_t i = 0; i < tag_count; ++i) {
+        const uint8_t *raw = main + head.len + 12 + i * 4;
+        tags[i] = (tagx_t){raw[0], raw[1], raw[2], raw[3]};
+    }
+    for (uint32_t j = 0; j < head.nctoc; ++j) {
+        size_t block = (size_t)b->ncx_index + head.count + 1 + j;
+        sources[j] = record_read(b, block, &source_len[j], 1048576u);
+        if (!sources[j]) goto done;
+        size_t at = 0;
+        while (at < source_len[j] && sources[j][at]) {
+            size_t begin = at;
+            uint32_t name_len = 0;
+            if (!vwi_read(sources[j], source_len[j], &at, &name_len)) goto done;
+            if ((uint64_t)at + name_len > source_len[j]) goto done;
+            if (map_count == map_cap) {
+                size_t cap = map_cap ? map_cap * 2 : 256;
+                ctoc_t *grown = heap_caps_realloc(map, cap * sizeof(*grown), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (!grown) { err = ESP_ERR_NO_MEM; goto done; }
+                map = grown; map_cap = cap;
+            }
+            map[map_count].key = (uint32_t)begin + j * 0x10000u;
+            map[map_count].text = (const char *)sources[j] + at;
+            map[map_count].len = name_len;
+            ++map_count;
+            at += name_len;
+        }
+    }
+    if (!map_count) goto done;
+    qsort(map, map_count, sizeof(*map), ctoc_cmp);
+    for (uint32_t r = 1; r <= head.count; ++r) {
+        size_t sub_len = 0;
+        uint8_t *sub = record_read(b, (size_t)b->ncx_index + r, &sub_len, 1048576u);
+        if (!sub) { err = ESP_ERR_INVALID_SIZE; goto done; }
+        indx_head_t sh = indx_head(sub, sub_len);
+        if (!sh.ok || !sh.count || (uint64_t)sh.start + 4 + (uint64_t)sh.count * 2 > sub_len) { free(sub); continue; }
+        for (uint32_t e = 0; e < sh.count; ++e) {
+            size_t begin = be16(sub + sh.start + 4 + (size_t)e * 2);
+            size_t end = e + 1 < sh.count ? be16(sub + sh.start + 4 + (size_t)(e + 1) * 2) : sh.start;
+            uint32_t pos = 0, noffs = 0;
+            if (!index_entry(sub, sub_len, begin, end, tags, tag_count, control_bytes, &pos, &noffs)) continue;
+            ctoc_t key = {noffs, 0, NULL};
+            const ctoc_t *found = bsearch(&key, map, map_count, sizeof(*map), ctoc_cmp);
+            if (!found || !found->len || pos >= b->total) continue;
+            if (built_count >= MOBI_NAV_MAX) { free(sub); err = ESP_ERR_INVALID_SIZE; goto done; }
+            if (built_count == built_cap) {
+                size_t cap = built_cap ? built_cap * 2 : 64;
+                navigation_t *grown = heap_caps_realloc(built, cap * sizeof(*grown), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (!grown) { free(sub); err = ESP_ERR_NO_MEM; goto done; }
+                built = grown; built_cap = cap;
+            }
+            char *utf8 = NULL;
+            size_t bytes = 0;
+            if (book_mobi_decode(found->text, found->len, b->encoding, &utf8, &bytes) != ESP_OK) { free(sub); continue; }
+            navigation_t *slot = &built[built_count];
+            memset(slot, 0, sizeof(*slot));
+            slot->offset = pos;
+            size_t n = bytes < sizeof(slot->title) - 1 ? bytes : sizeof(slot->title) - 1;
+            while (n && n < bytes && ((uint8_t)utf8[n] & 0xc0) == 0x80) --n;
+            memcpy(slot->title, utf8, n);
+            free(utf8);
+            if (n) ++built_count;
+        }
+        free(sub);
+    }
+    if (built_count < 2) goto done;
+    // 目录按正文位置排序并去重，位置相同的保留先出现的标题。
+    // Sort by body position and drop duplicates, keeping the first title at a position.
+    for (size_t i = 1; i < built_count; ++i) {
+        navigation_t item = built[i];
+        size_t j = i;
+        while (j && built[j - 1].offset > item.offset) { built[j] = built[j - 1]; --j; }
+        built[j] = item;
+    }
+    size_t unique = 0;
+    for (size_t i = 0; i < built_count; ++i)
+        if (!unique || built[i].offset != built[unique - 1].offset) built[unique++] = built[i];
+    if (unique < 2) goto done;
+    free(b->navigation);
+    b->navigation = built;
+    b->nav_count = unique;
+    b->nav_cap = built_cap;
+    built = NULL;
+    err = ESP_OK;
+done:
+    free(main);
+    for (unsigned j = 0; j < 8; ++j) free(sources[j]);
+    free(map);
+    free(built);
+    return err;
+}
+
 static esp_err_t add_segment(book_mobi_t *b, uint32_t offset) {
     if (b->count && b->segments[b->count - 1] == offset) return ESP_OK;
     if (b->count == MOBI_NAV_MAX) return ESP_ERR_INVALID_SIZE;
@@ -373,6 +776,9 @@ static esp_err_t build_index(book_mobi_t *b) {
                 b->navigation[out++] = b->navigation[i];
         b->nav_count = out;
     }
+    // ncx 索引比正文目录页更可靠：命中两项以上就整表替换。
+    // The ncx index beats an authored TOC page: two or more entries replace the table wholesale.
+    if (b->nav_count < MOBI_NAV_MAX) (void)ncx_navigation(b);
 done:
     free(compressed); free(raw); free(pending); free(scan);
     return err;
@@ -470,6 +876,8 @@ esp_err_t book_mobi_open(const char *path, book_mobi_t **out) {
 void book_mobi_close(book_mobi_t *b) {
     if (!b) return;
     if (b->file) fclose(b->file);
+    for (size_t i = 0; i < b->pool_count; ++i) free(b->pool[i]);
+    free(b->pool); free(b->dict);
     free(b->record); free(b->segments); free(b->navigation); free(b);
 }
 size_t book_mobi_chapter_count(const book_mobi_t *b) { return b ? b->count : 0; }
@@ -537,6 +945,15 @@ esp_err_t book_mobi_load_target(book_mobi_t *b, size_t i, const char *anchor, si
     free(compressed); compressed = NULL; free(raw); raw = NULL;
     err = book_mobi_markup(text, len, begin, b->encoding, b->first_image, b->records,
                            anchor, source_offset, text_offset, out);
+    /* 中文：目录点击按"章内源偏移"定位。锚点链在个别书上会返回 0 或落不到标题上，
+     * 此时退回已核实的章首块；块没有独立成段时再退回正文里标题第一次出现的位置。
+     * English: TOC clicks locate by an in-segment source offset. On some books the anchor
+     * chain returns 0 or misses the heading, so fall back to the verified chapter-start
+     * block, and when no block carries the title alone, to the title's first body hit. */
+    const bool source_request = !anchor && source_offset != SIZE_MAX && source_offset < len;
+    const uint32_t requested = source_request ? begin + (uint32_t)source_offset : UINT32_MAX;
+    const char *requested_title = NULL;
+    size_t snap = SIZE_MAX;
     if (err == ESP_OK) for (size_t n = 0; n < b->nav_count; ++n) {
         if (chapter_at(b, b->navigation[n].offset) != i) continue;
         size_t title_len = strlen(b->navigation[n].title);
@@ -548,7 +965,26 @@ esp_err_t book_mobi_load_target(book_mobi_t *b, size_t i, const char *anchor, si
             if (block->image < 0 && !block->linked && !block->auxiliary && size == title_len &&
                 !memcmp(out->utf8 + from, b->navigation[n].title, size)) {
                 block->heading = true; block->heading_level = 1; block->chapter_start = true;
+                if (b->navigation[n].offset == requested) {
+                    requested_title = b->navigation[n].title;
+                    snap = block->offset;
+                }
                 break;
+            }
+        }
+    }
+    if (err == ESP_OK && text_offset && source_request && requested_title && requested_title[0]) {
+        bool at_title = *text_offset <= out->len;
+        if (at_title) {
+            const char *landed = out->utf8 + *text_offset;
+            while (isspace((unsigned char)*landed)) ++landed;
+            at_title = strncmp(landed, requested_title, strlen(requested_title)) == 0;
+        }
+        if (!at_title) {
+            if (snap != SIZE_MAX) *text_offset = snap;
+            else {
+                const char *hit = strstr(out->utf8, requested_title);
+                if (hit) *text_offset = (size_t)(hit - out->utf8);
             }
         }
     }
